@@ -5,6 +5,23 @@ import { LESSON_2_VOICE_MVP_QUESTIONS } from "../../../server/prompts/lesson2Voi
 type ConnectionState = "idle" | "connecting" | "active" | "ended" | "error";
 type Lesson1Step = "NAME" | "FROM" | "LIVE" | "WORK" | "LIKE" | "DONE";
 
+// Tipos para el sistema multi-agente
+type JudgeDecision =
+  | "advance"
+  | "correct_and_retry"
+  | "clarify_and_retry"
+  | "off_topic_retry"
+  | "ignore";
+
+interface AnalysisResult {
+  success: boolean;
+  decision: JudgeDecision;
+  shouldAdvance: boolean;
+  tutorInstruction: string;
+  grammarFeedback?: string;
+  processingTimeMs: number;
+}
+
 export interface ConversationMessage {
   id: string;
   role: "user" | "assistant";
@@ -50,6 +67,36 @@ async function speakWithTTS(text: string): Promise<void> {
   } catch (error) {
     console.error("❌ [TTS] Error:", error);
     throw error;
+  }
+}
+
+// Helper para llamar al endpoint de análisis multi-agente
+async function analyzeResponse(
+  transcription: string,
+  questionIndex: number,
+  sessionId: string
+): Promise<AnalysisResult> {
+  try {
+    const response = await fetch("/api/analysis/evaluate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        transcription,
+        questionIndex,
+        lessonNumber: 1,
+        sessionId,
+      }),
+    });
+    return await response.json();
+  } catch (error) {
+    console.error("Analysis error:", error);
+    return {
+      success: false,
+      decision: "ignore",
+      shouldAdvance: false,
+      tutorInstruction: "",
+      processingTimeMs: 0,
+    };
   }
 }
 
@@ -206,7 +253,7 @@ export function useRealtimeConversation({ lesson = 1, part = 1 } = {}) {
         }
       };
 
-      dc.onmessage = (event) => {
+      dc.onmessage = async (event) => {
         let data;
         try {
           data = JSON.parse(event.data);
@@ -289,7 +336,7 @@ export function useRealtimeConversation({ lesson = 1, part = 1 } = {}) {
               // No additional speech needed - conversation ends naturally
             }, 500);
           } else {
-            // Lesson 1: Just add to messages, Realtime handles the rest
+            // Lesson 1: Usar sistema multi-agente para análisis
             setMessages((m) => [
               ...m,
               {
@@ -299,22 +346,67 @@ export function useRealtimeConversation({ lesson = 1, part = 1 } = {}) {
                 timestamp: Date.now(),
               },
             ]);
+
+            // Llamar al sistema multi-agente para análisis
+            const analysis = await analyzeResponse(
+              userText,
+              currentQuestionIndexRef.current + 1,
+              sessionIdRef.current || "unknown"
+            );
+
+            console.log(
+              `[ANALYSIS] Decision: ${analysis.decision}, Advance: ${analysis.shouldAdvance}`
+            );
+
+            switch (analysis.decision) {
+              case "advance":
+                currentQuestionIndexRef.current += 1;
+                // Reproducir feedback positivo con TTS
+                if (analysis.tutorInstruction) {
+                  await speakWithTTS(analysis.tutorInstruction);
+                  setMessages((m) => [
+                    ...m,
+                    {
+                      id: crypto.randomUUID(),
+                      role: "assistant",
+                      text: analysis.tutorInstruction,
+                      timestamp: Date.now(),
+                    },
+                  ]);
+                }
+                break;
+
+              case "correct_and_retry":
+              case "clarify_and_retry":
+              case "off_topic_retry":
+                // Reproducir corrección con TTS
+                if (analysis.tutorInstruction) {
+                  await speakWithTTS(analysis.tutorInstruction);
+                  setMessages((m) => [
+                    ...m,
+                    {
+                      id: crypto.randomUUID(),
+                      role: "assistant",
+                      text: analysis.tutorInstruction,
+                      timestamp: Date.now(),
+                    },
+                  ]);
+                }
+                break;
+
+              case "ignore":
+              default:
+                break;
+            }
           }
         }
 
-        // Lesson 1: Show AI responses in transcript
+        // Lesson 1: Show AI responses in transcript (para respuestas de Realtime si las hay)
         if (lesson === 1 && data.type === "response.audio_transcript.done") {
           const aiText = data.transcript;
           if (aiText && aiText.trim() !== "") {
-            setMessages((m) => [
-              ...m,
-              {
-                id: crypto.randomUUID(),
-                role: "assistant",
-                text: aiText,
-                timestamp: Date.now(),
-              },
-            ]);
+            // Solo mostrar si no es una respuesta del sistema multi-agente
+            console.log(`[REALTIME] AI response: "${aiText.substring(0, 50)}..."`);
           }
         }
       };

@@ -8,3 +8,6 @@ export * from "./validationPrompt";
 export * from "./conversationPrompt";
 export * from "./pedagogyPrompt";
 export * from "./controlPrompt";
+export * from "./grammarPrompt";
+export * from "./verifierPrompt";
+export * from "./judgePrompt";

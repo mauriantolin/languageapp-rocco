@@ -2,6 +2,69 @@ import { useState, useRef, useEffect, useCallback } from "react";
 
 type ConnectionState = "idle" | "connecting" | "active" | "ended" | "error";
 
+type JudgeDecision =
+  | "advance"
+  | "correct_and_retry"
+  | "clarify_and_retry"
+  | "off_topic_retry"
+  | "ignore";
+
+interface AnalysisResult {
+  success: boolean;
+  decision: JudgeDecision;
+  shouldAdvance: boolean;
+  tutorInstruction: string;
+  grammarFeedback?: string;
+  processingTimeMs: number;
+}
+
+// Helper para llamar al endpoint de análisis multi-agente
+async function analyzeResponse(
+  transcription: string,
+  questionIndex: number,
+  sessionId: string
+): Promise<AnalysisResult> {
+  try {
+    const response = await fetch("/api/analysis/evaluate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        transcription,
+        questionIndex,
+        lessonNumber: 1,
+        sessionId,
+      }),
+    });
+    return await response.json();
+  } catch (error) {
+    console.error("Analysis error:", error);
+    return {
+      success: false,
+      decision: "ignore",
+      shouldAdvance: false,
+      tutorInstruction: "",
+      processingTimeMs: 0,
+    };
+  }
+}
+
+// Helper para reproducir feedback con TTS
+async function speakFeedback(text: string): Promise<void> {
+  if (!text) return;
+  try {
+    const response = await fetch("/api/tts/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, voice: "nova", speed: 1.0 }),
+    });
+    const blob = await response.blob();
+    const audio = new Audio(URL.createObjectURL(blob));
+    await audio.play();
+  } catch (error) {
+    console.error("TTS error:", error);
+  }
+}
+
 export interface ConversationMessage {
   id: string;
   role: "user" | "assistant";
@@ -244,7 +307,7 @@ export function useSimpleConversation(): UseSimpleConversationReturn {
             resolve(token);
           });
 
-          dc.addEventListener("message", (event) => {
+          dc.addEventListener("message", async (event) => {
             const data = JSON.parse(event.data);
 
             // --- EVENTO 1: EL USUARIO TERMINA DE HABLAR ---
@@ -254,47 +317,14 @@ export function useSimpleConversation(): UseSimpleConversationReturn {
             ) {
               const text = data.transcript?.trim();
               if (!text || text.length < 2) {
-                // Si es ruido, bloqueamos todo
                 canAdvanceRef.current = false;
-                expectingResponseRef.current = false; // 🔒 Semáforo en ROJO
+                expectingResponseRef.current = false;
                 return;
               }
 
               const currentIndex = lessonStateRef.current.globalQuestionIndex;
-              const grammar = validateStudentGrammar(text);
 
-              if (!grammar.isValid) {
-                canAdvanceRef.current = false;
-                expectingResponseRef.current = false; // 🔒 Semáforo en ROJO (Va a corregir, no avanzar)
-                dc.send(
-                  JSON.stringify({
-                    type: "response.create",
-                    response: {
-                      instructions: `Error: "${text}". Feedback: ${grammar.feedback}. Execute CORRECTION ALGORITHM.`,
-                    },
-                  }),
-                );
-                return;
-              }
-
-              if (isWhatDoesQuestion(currentIndex) && looksLikeEnglish(text)) {
-                canAdvanceRef.current = false;
-                expectingResponseRef.current = false; // 🔒 Semáforo en ROJO
-                dc.send(
-                  JSON.stringify({
-                    type: "response.create",
-                    response: {
-                      instructions: `Error: Answered in English. Tell student to translate to Spanish and repeat question.`,
-                    },
-                  }),
-                );
-                return;
-              }
-
-              // ✅ Si llegamos acá, la respuesta es válida
-              canAdvanceRef.current = true;
-              expectingResponseRef.current = true; // 🔓 SEMÁFORO EN VERDE (Esperamos que la IA responda para avanzar)
-
+              // Guardar mensaje del usuario inmediatamente
               setMessages((prev) => [
                 ...prev,
                 {
@@ -305,20 +335,68 @@ export function useSimpleConversation(): UseSimpleConversationReturn {
                 },
               ]);
               saveMessageToBackend("user", text);
+
+              // NUEVO: Llamar al sistema multi-agente para análisis
+              const analysis = await analyzeResponse(
+                text,
+                currentIndex,
+                simpleSessionIdRef.current || "unknown"
+              );
+
+              console.log(
+                `[ANALYSIS] Decision: ${analysis.decision}, Advance: ${analysis.shouldAdvance}`
+              );
+
+              // Actuar según la decisión del Juez
+              switch (analysis.decision) {
+                case "advance":
+                  canAdvanceRef.current = true;
+                  expectingResponseRef.current = true;
+                  // Reproducir feedback positivo con TTS
+                  if (analysis.tutorInstruction) {
+                    await speakFeedback(analysis.tutorInstruction);
+                  }
+                  // Avanzar a la siguiente pregunta
+                  await handleAdvanceQuestion();
+                  break;
+
+                case "correct_and_retry":
+                case "clarify_and_retry":
+                case "off_topic_retry":
+                  canAdvanceRef.current = false;
+                  expectingResponseRef.current = false;
+                  // Reproducir corrección/clarificación con TTS
+                  if (analysis.tutorInstruction) {
+                    await speakFeedback(analysis.tutorInstruction);
+                    // Guardar mensaje del tutor
+                    setMessages((prev) => [
+                      ...prev,
+                      {
+                        id: `a-${Date.now()}`,
+                        role: "assistant",
+                        text: analysis.tutorInstruction,
+                        timestamp: Date.now(),
+                      },
+                    ]);
+                    saveMessageToBackend("assistant", analysis.tutorInstruction);
+                  }
+                  break;
+
+                case "ignore":
+                default:
+                  canAdvanceRef.current = false;
+                  expectingResponseRef.current = false;
+                  break;
+              }
             }
 
-            // --- EVENTO 2: LA IA TERMINA DE HABLAR ---
+            // --- EVENTO 2: LA IA TERMINA DE HABLAR (solo para respuestas de Realtime) ---
             if (data.type === "response.audio_transcript.done") {
               const aiText = data.transcript?.trim();
               if (!aiText || isResettingRef.current) return;
 
-              // 🛑 AQUÍ ESTÁ EL FIX DEL "JUMPING"
-              // Solo procesamos el avance si el semáforo estaba en VERDE
+              // Solo guardar si el semáforo estaba en verde (respuesta esperada)
               if (expectingResponseRef.current) {
-                handleAiResponse(aiText);
-                expectingResponseRef.current = false; // 🔒 Volvemos a poner en ROJO hasta que el usuario hable de nuevo
-              } else {
-                // Si el semáforo estaba en rojo, solo guardamos el mensaje pero NO AVANZAMOS
                 setMessages((prev) => [
                   ...prev,
                   {
@@ -328,6 +406,8 @@ export function useSimpleConversation(): UseSimpleConversationReturn {
                     timestamp: Date.now(),
                   },
                 ]);
+                saveMessageToBackend("assistant", aiText);
+                expectingResponseRef.current = false;
               }
             }
           });
@@ -360,62 +440,49 @@ export function useSimpleConversation(): UseSimpleConversationReturn {
     [closeRealtimeConnection, saveMessageToBackend],
   );
 
-  const handleAiResponse = async (aiTranscript: string) => {
-    // Protección doble: si no hay sesión o ya estamos procesando, salir
+  // Función para avanzar a la siguiente pregunta (llamada por el sistema multi-agente)
+  const handleAdvanceQuestion = async () => {
     if (!simpleSessionIdRef.current || isProcessingRef.current) return;
 
     isProcessingRef.current = true;
     try {
+      // Obtener información de la siguiente pregunta del backend
       const response = await fetch(
         `/api/assistant/simple-session/${simpleSessionIdRef.current}/process-response`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ aiTranscript }),
+          body: JSON.stringify({ aiTranscript: "ADVANCE_CONFIRMED" }),
         },
       );
 
       const result = await response.json();
 
-      if (canAdvanceRef.current && result.advanced) {
+      if (result.advanced) {
         const newIndex = result.currentIndex;
         lessonStateRef.current.globalQuestionIndex = newIndex;
         lessonStateRef.current.correctCount += 1;
         setLessonProgress({ ...lessonStateRef.current });
 
-        // AVISAR A OPENAI QUE CAMBIAMOS DE PREGUNTA
-        if (dcRef.current && dcRef.current.readyState === "open") {
-          dcRef.current.send(
-            JSON.stringify({
-              type: "session.update",
-              session: {
-                instructions: `STRICT ORDER: You are on question ${newIndex}. Ask ONLY: "${result.currentQuestion}". No small talk.`,
-              },
-            }),
-          );
-          setTimeout(() => {
-            dcRef.current?.send(JSON.stringify({ type: "response.create" }));
-          }, 50);
+        // Verificar si llegamos al final
+        if (newIndex > TOTAL_QUESTIONS) {
+          await speakFeedback("¡Felicidades! Has completado todas las preguntas.");
+          return;
         }
 
-        if (newIndex > TOTAL_QUESTIONS) return;
+        // Verificar si necesitamos resetear la sesión (cada QUESTION_BLOCK_SIZE preguntas)
         if (newIndex > 1 && (newIndex - 1) % QUESTION_BLOCK_SIZE === 0) {
           await resetRealtimeSession(newIndex);
           return;
         }
+
+        // Leer la siguiente pregunta con TTS
+        if (result.currentQuestion) {
+          await speakFeedback(result.currentQuestion);
+        }
       }
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `a-${Date.now()}`,
-          role: "assistant",
-          text: aiTranscript,
-          timestamp: Date.now(),
-        },
-      ]);
-      saveMessageToBackend("assistant", aiTranscript);
     } catch (error) {
-      console.error(error);
+      console.error("Error advancing question:", error);
     } finally {
       isProcessingRef.current = false;
     }

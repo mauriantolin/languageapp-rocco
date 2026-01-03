@@ -9,6 +9,7 @@ import { desc } from "drizzle-orm";
 import { z } from "zod";
 import { assistantRouter } from "./assistantRoutes";
 import { ttsRouter } from "./ttsRoutes";
+import { analysisRouter } from "./analysisRoutes";
 import { estimateSessionCost, logSessionCost } from "./utils/costEstimator";
 
 interface AuthRequest extends Request {
@@ -765,6 +766,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // OpenAI Text-to-Speech routes (POC for deterministic voice output)
   app.use("/api/tts", ttsRouter);
+
+  // Multi-agent analysis routes
+  app.use("/api/analysis", analysisRouter);
 
   const httpServer = createServer(app);
   return httpServer;
